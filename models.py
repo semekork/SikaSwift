@@ -3,22 +3,24 @@ from sqlmodel import SQLModel, Field
 from datetime import datetime
 import uuid
 
+class User(SQLModel, table=True):
+    telegram_id: str = Field(primary_key=True)
+    phone_number: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 class Transaction(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     
-    # Who is Sending the money?
+    # We save this so the Webhook knows who to message
+    telegram_chat_id: Optional[str] = None 
+    
     sender_phone: str
-    receiver_phone: str
+    recipient_phone: str 
     amount: float
-    
-    # Status Machine
     status: str = Field(default="INIT")
-    # Options: INIT, PENDING_DEBIT, DEBIT_SUCCESS, DISBURSING, COMPLETE, FAILED
     
-    # Tracking IDs 
-    paystack_reference: Optional[str] = None # The ID for the "Charge"
-    recipient_code: Optional[str] = None # The ID for the "Transfer"
+    paystack_reference: Optional[str] = None 
+    transfer_code: Optional[str] = None      
     
-    # Timestammps
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

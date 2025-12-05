@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-requests
-python-dotenv
 sqlmodel
 psycopg2-binary
-python-multipart
-httpx
+requests
+python-dotenv
