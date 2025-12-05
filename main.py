@@ -7,14 +7,17 @@ from contextlib import asynccontextmanager
 from sqlmodel import Session, select
 from dotenv import load_dotenv
 
+# --- LOCAL IMPORTS ---
 from database import init_db, get_session
 from models import Transaction, User
 from nlp import parse_message
 from telegram_utils import (
     send_message, 
+    send_photo, 
     send_name_confirmation, 
     request_phone_number, 
     delete_message_buttons,
+    delete_message, 
     answer_callback
 )
 from paystack_utils import (
@@ -24,7 +27,11 @@ from paystack_utils import (
     initiate_transfer,
     resolve_mobile_money
 )
+from security_utils import hash_pin, verify_pin
+from receipt_utils import generate_receipt
+from qr_utils import generate_payment_qr  # <--- NEW IMPORT
 
+# --- CONFIG ---
 load_dotenv()
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
 
@@ -35,36 +42,125 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="SikaSwift Bot 🤖")
 
-# --- 1. TELEGRAM WEBHOOK ---
+# =============================================================================
+# 1. TELEGRAM WEBHOOK
+# =============================================================================
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request, session: Session = Depends(get_session)):
     data = await request.json()
     
-    # A. HANDLE BUTTONS
+    # --- A. HANDLE BUTTON CLICKS ---
     if "callback_query" in data:
         await handle_callback(data["callback_query"], session)
         return {"status": "ok"}
     
-    # B. HANDLE MESSAGES
+    # --- B. HANDLE MESSAGES ---
     if "message" in data:
         msg = data["message"]
         chat_id = str(msg["chat"]["id"])
+        message_id = msg.get("message_id")
         
+        # 1. CONTACT SHARING
         if "contact" in msg:
             phone = msg["contact"]["phone_number"].replace("+", "")
-            user = User(telegram_id=chat_id, phone_number=phone)
-            session.merge(user)
-            session.commit()
-            send_message(chat_id, "✅ Phone saved! Try sending money again.")
-            return {"status": "ok"}
+            user = session.get(User, chat_id)
             
+            # Identity Verification (Reset PIN)
+            if user and user.state == "AWAITING_RESET_AUTH":
+                if user.phone_number == phone:
+                    user.pin_hash = None
+                    user.state = "AWAITING_NEW_PIN"
+                    session.add(user)
+                    session.commit()
+                    send_message(chat_id, "✅ **Identity Verified!**\nEnter your **NEW 4-digit PIN**:")
+                else:
+                    user.state = "IDLE"
+                    session.add(user)
+                    session.commit()
+                    send_message(chat_id, "❌ Number mismatch. Verification Failed.")
+                return {"status": "ok"}
+            
+            # New Registration
+            if not user:
+                user = User(telegram_id=chat_id, phone_number=phone, state="IDLE")
+                session.merge(user)
+                session.commit()
+                send_message(chat_id, "✅ Phone saved! **Type /setpin to secure your account.**")
+                return {"status": "ok"}
+            
+        # 2. TEXT PROCESSING
         if "text" in msg:
             text = msg["text"].strip()
-            
-            # OTP Check
             user = session.get(User, chat_id)
+            
             if user:
+                # --- SECURITY: AUTO-DELETE PIN ---
+                if user.state in ["AWAITING_NEW_PIN", "AWAITING_PIN_AUTH"] and len(text) == 4 and text.isdigit():
+                    delete_message(chat_id, message_id)
+
+                # --- STATE MACHINE ---
+                
+                # 1. SETTING PIN
+                if user.state == "AWAITING_NEW_PIN":
+                    if len(text) == 4 and text.isdigit():
+                        user.pin_hash = hash_pin(text)
+                        user.state = "IDLE"
+                        session.add(user)
+                        session.commit()
+                        send_message(chat_id, "🔐 **PIN Set Successfully!**")
+                    else:
+                        send_message(chat_id, "❌ PIN must be 4 digits.")
+                    return {"status": "ok"}
+
+                # 2. VERIFYING PIN (PAYMENT)
+                if user.state == "AWAITING_PIN_AUTH":
+                    if verify_pin(text, user.pin_hash):
+                        try:
+                            amount, recipient = user.temp_data.split("|")
+                            amount = float(amount)
+                            user.state = "IDLE"
+                            user.temp_data = None
+                            session.add(user)
+                            session.commit()
+                            
+                            send_message(chat_id, "🔓 **PIN Verified.** Processing payment...")
+                            await execute_charge(chat_id, user, amount, recipient, session)
+                        except:
+                            send_message(chat_id, "❌ Error. Try again.")
+                            user.state = "IDLE"
+                            session.add(user)
+                            session.commit()
+                    else:
+                        send_message(chat_id, "❌ **Wrong PIN.** Cancelled.")
+                        user.state = "IDLE"
+                        user.temp_data = None
+                        session.add(user)
+                        session.commit()
+                    return {"status": "ok"}
+
+                # 3. QR CODE: AMOUNT ENTRY (NEW!)
+                if user.state == "AWAITING_QR_AMOUNT":
+                    # User scanned QR and is now typing amount (e.g., "50")
+                    if text.replace('.', '', 1).isdigit():
+                        amount = float(text)
+                        recipient = user.temp_data # We saved this during scan
+                        
+                        # Reset State
+                        user.state = "IDLE"
+                        user.temp_data = None
+                        session.add(user)
+                        session.commit()
+                        
+                        # Trigger Confirmation
+                        verification = resolve_mobile_money(recipient)
+                        name = verification["account_name"] if verification["status"] else "Unknown"
+                        send_name_confirmation(chat_id, amount, recipient, name)
+                    else:
+                        send_message(chat_id, "❌ Invalid amount. Enter a number (e.g. 10).")
+                    return {"status": "ok"}
+
+                # 4. WAITING FOR OTP (Legacy)
                 statement = select(Transaction).where(
                     Transaction.sender_phone == user.phone_number,
                     Transaction.status == "WAITING_FOR_OTP"
@@ -74,36 +170,111 @@ async def telegram_webhook(request: Request, session: Session = Depends(get_sess
                     await handle_otp_entry(chat_id, text, pending_txn, session)
                     return {"status": "ok"}
 
-            if text == "/start":
-                send_message(chat_id, "👋 Welcome! Type 'Send 1 to 055...'")
+            # --- COMMANDS ---
+
+            # QR GENERATION (NEW!)
+            if text == "/myqr":
+                if not user:
+                    send_message(chat_id, "Register first: /start")
+                    return {"status": "ok"}
+                
+                send_message(chat_id, "🎨 Generating your Payment QR...")
+                qr_file = generate_payment_qr(user.phone_number)
+                send_photo(chat_id, qr_file, caption=f"Scan to pay **{user.phone_number}**")
+                try: os.remove(qr_file) 
+                except: pass
                 return {"status": "ok"}
 
-            nlp_result = parse_message(text)
+            # QR SCANNING (Deep Link) (NEW!)
+            if text.startswith("/start pay_"):
+                # Format: /start pay_0555123456
+                try:
+                    target_phone = text.split("pay_")[1]
+                    if not user:
+                        request_phone_number(chat_id)
+                        return {"status": "ok"}
+                    
+                    send_message(chat_id, f"🔍 QR Scanned! Verifying {target_phone}...")
+                    verification = resolve_mobile_money(target_phone)
+                    name = verification["account_name"] if verification["status"] else "Unknown User"
+                    
+                    user.state = "AWAITING_QR_AMOUNT"
+                    user.temp_data = target_phone
+                    session.add(user)
+                    session.commit()
+                    
+                    send_message(chat_id, f"✅ **Recipient:** {name}\n\n**How much do you want to send?**\n(Type the amount)")
+                except:
+                    send_message(chat_id, "❌ Invalid QR Code.")
+                return {"status": "ok"}
+
+            # STANDARD COMMANDS
+            if text == "/start":
+                send_message(chat_id, "👋 **Welcome!**\n\n/setpin - Secure Account\n/myqr - Get Payment Code\n/history - View Transactions")
+                return {"status": "ok"}
             
+            if text == "/setpin":
+                if not user:
+                    request_phone_number(chat_id)
+                else:
+                    user.state = "AWAITING_NEW_PIN"
+                    session.add(user)
+                    session.commit()
+                    send_message(chat_id, "🔐 Enter a **4-digit PIN**:")
+                return {"status": "ok"}
+
+            if text == "/resetpin":
+                if not user:
+                    send_message(chat_id, "Register first.")
+                else:
+                    user.state = "AWAITING_RESET_AUTH"
+                    session.add(user)
+                    session.commit()
+                    request_phone_number(chat_id) 
+                    send_message(chat_id, "⚠️ **Security Check**\nTap 'Share Phone Number' below to reset PIN.")
+                return {"status": "ok"}
+            
+            if text == "/history":
+                if not user: return {"status": "ok"}
+                statement = select(Transaction).where(Transaction.sender_phone == user.phone_number).order_by(Transaction.created_at.desc()).limit(5)
+                txns = session.exec(statement).all()
+                if not txns:
+                    send_message(chat_id, "📭 No transactions found.")
+                else:
+                    msg = "📜 **Recent Transactions**\n\n"
+                    for t in txns:
+                        icon = "✅" if t.status in ["DISBURSING", "COMPLETE"] else "⏳"
+                        msg += f"{icon} **{t.amount} GHS** → {t.recipient_phone}\n\n"
+                    send_message(chat_id, msg)
+                return {"status": "ok"}
+
+            # NLP / SEND MONEY
+            nlp_result = parse_message(text)
             if nlp_result["intent"] == "SEND_MONEY":
                 if nlp_result["amount"] and nlp_result["recipient"]:
                     if not user:
                         request_phone_number(chat_id)
+                        return {"status": "ok"}
+                    
+                    if not user.pin_hash:
+                        send_message(chat_id, "⚠️ Set a PIN first: /setpin")
+                        return {"status": "ok"}
+
+                    send_message(chat_id, "🔍 Verifying recipient...")
+                    verification = resolve_mobile_money(nlp_result["recipient"])
+                    
+                    if verification["status"]:
+                        send_name_confirmation(chat_id, nlp_result["amount"], nlp_result["recipient"], verification["account_name"])
                     else:
-                        # NEW: VERIFY NAME BEFORE CONFIRMATION
-                        send_message(chat_id, "🔍 Verifying recipient...")
-                        verification = resolve_mobile_money(nlp_result["recipient"])
-                        
-                        if verification["status"]:
-                            send_name_confirmation(
-                                chat_id, 
-                                nlp_result["amount"], 
-                                nlp_result["recipient"], 
-                                verification["account_name"]
-                            )
-                        else:
-                            send_message(chat_id, "⚠️ Could not verify that number. Please check it.")
+                        send_message(chat_id, "⚠️ Could not verify name.")
                 else:
-                    send_message(chat_id, "I need amount and recipient.")
-            else:
-                send_message(chat_id, "I didn't understand.")
+                    send_message(chat_id, "Try: 'Send 50 to 055...'")
 
     return {"status": "ok"}
+
+# =============================================================================
+# 2. HELPER FUNCTIONS
+# =============================================================================
 
 async def handle_callback(callback, session):
     chat_id = str(callback["message"]["chat"]["id"])
@@ -120,39 +291,45 @@ async def handle_callback(callback, session):
 
     if action_data.startswith("pay_"):
         parts = action_data.split("_")
-        amount = float(parts[1])
+        amount = parts[1]
         recipient = parts[2]
         
         user = session.get(User, chat_id)
-        if not user:
-            send_message(chat_id, "❌ User not found.")
-            return
+        if not user: return
 
-        send_message(chat_id, f"⏳ Initiating Charge... Check your phone!")
+        # Trigger Security Check
+        user.state = "AWAITING_PIN_AUTH"
+        user.temp_data = f"{amount}|{recipient}"
+        session.add(user)
+        session.commit()
         
-        response = initiate_charge(user.phone_number, amount)
-        
-        if response.get("status"):
-            ref = response["data"]["reference"]
-            p_status = response["data"].get("status")
-            
-            txn_status = "WAITING_FOR_OTP" if p_status == "send_otp" else "PENDING_DEBIT"
-            msg = "🔐 **OTP Required!** Type it here." if p_status == "send_otp" else "✅ **Prompt Sent.** Approve on your phone."
+        send_message(chat_id, "🔒 **Security Check**\nEnter your **4-digit PIN**:")
 
-            new_txn = Transaction(
-                telegram_chat_id=chat_id,
-                sender_phone=user.phone_number,
-                recipient_phone=recipient,
-                amount=amount,
-                status=txn_status,
-                paystack_reference=ref
-            )
-            session.add(new_txn)
-            session.commit()
-            
-            send_message(chat_id, msg)
-        else:
-            send_message(chat_id, f"❌ Error: {response.get('message')}")
+async def execute_charge(chat_id, user, amount, recipient, session):
+    send_message(chat_id, f"⏳ Authenticated. Prompt sent to {user.phone_number}...")
+    
+    response = initiate_charge(user.phone_number, amount)
+    
+    if response.get("status"):
+        ref = response["data"]["reference"]
+        p_status = response["data"].get("status")
+        
+        txn_status = "WAITING_FOR_OTP" if p_status == "send_otp" else "PENDING_DEBIT"
+        msg = "🔐 **OTP Required!**" if p_status == "send_otp" else "✅ **Prompt Sent.** Approve on phone."
+
+        new_txn = Transaction(
+            telegram_chat_id=chat_id,
+            sender_phone=user.phone_number,
+            recipient_phone=recipient,
+            amount=amount,
+            status=txn_status,
+            paystack_reference=ref
+        )
+        session.add(new_txn)
+        session.commit()
+        send_message(chat_id, msg)
+    else:
+        send_message(chat_id, f"❌ Charge Failed: {response.get('message')}")
 
 async def handle_otp_entry(chat_id, otp_code, txn, session):
     send_message(chat_id, "🔄 Verifying OTP...")
@@ -162,20 +339,22 @@ async def handle_otp_entry(chat_id, otp_code, txn, session):
         txn.status = "DEBIT_SUCCESS"
         session.add(txn)
         session.commit()
-        send_message(chat_id, "✅ OTP Verified! Waiting for confirmation...")
+        send_message(chat_id, "✅ Verified! Processing transfer...")
     else:
         send_message(chat_id, f"❌ Wrong OTP.")
 
-# --- 2. PAYSTACK WEBHOOK ---
+# =============================================================================
+# 3. PAYSTACK WEBHOOK
+# =============================================================================
 
 @app.post("/webhook")
 async def paystack_webhook(request: Request, session: Session = Depends(get_session)):
     body = await request.body()
     signature = request.headers.get("x-paystack-signature")
+    if not signature: return {"status": "denied"}
+        
     hash_calc = hmac.new(PAYSTACK_SECRET.encode('utf-8'), body, hashlib.sha512).hexdigest()
-    
-    if hash_calc != signature:
-        return {"status": "denied"}
+    if hash_calc != signature: return {"status": "denied"}
 
     event_data = await request.json()
     event_type = event_data.get("event")
@@ -186,33 +365,36 @@ async def paystack_webhook(request: Request, session: Session = Depends(get_sess
         statement = select(Transaction).where(Transaction.paystack_reference == reference)
         txn = session.exec(statement).first()
         
-        if txn and txn.status != "DISBURSING":
-            if txn.telegram_chat_id:
-                send_message(txn.telegram_chat_id, f"✅ **Received!**\nWe have your {txn.amount} GHS.")
-
+        if txn and txn.status != "DISBURSING" and txn.status != "COMPLETE":
             txn.status = "DEBIT_SUCCESS"
             session.add(txn)
             session.commit()
             
-            # WAIT FOR BALANCE UPDATE
+            if txn.telegram_chat_id:
+                send_message(txn.telegram_chat_id, f"✅ **Payment Received!**\nMoving money to recipient...")
+
             await asyncio.sleep(2)
             
-            # TRANSFER TO RECIPIENT
             recip_resp = create_transfer_recipient("Verified User", txn.recipient_phone)
+            
             if recip_resp.get("status"):
                 r_code = recip_resp['data']['recipient_code']
                 txn.transfer_code = r_code
                 
-                send_message(txn.telegram_chat_id, "🔄 Sending to recipient...")
                 transfer_resp = initiate_transfer(txn.amount, r_code)
                 
                 if transfer_resp.get("status"):
                     txn.status = "DISBURSING"
-                    send_message(txn.telegram_chat_id, f"🚀 **Sent!** Money is on the way.")
+                    if txn.telegram_chat_id:
+                        # RECEIPT GENERATION
+                        receipt_file = generate_receipt(txn.sender_phone, txn.recipient_phone, txn.amount, txn.paystack_reference)
+                        send_photo(txn.telegram_chat_id, receipt_file, caption="✅ **Transfer Complete!**")
+                        try: os.remove(receipt_file)
+                        except: pass
                 else:
                     txn.status = "TRANSFER_FAILED"
-                    err = transfer_resp.get("message")
-                    send_message(txn.telegram_chat_id, f"⚠️ Debit Success, but Transfer Failed: {err}")
+                    if txn.telegram_chat_id:
+                        send_message(txn.telegram_chat_id, f"⚠️ Debit Success, Transfer Failed: {transfer_resp.get('message')}")
             
             session.add(txn)
             session.commit()
