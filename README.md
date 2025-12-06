@@ -2,18 +2,18 @@
 > The AI-powered Fintech Bot for Ghana 🇬🇭. Send money, generate receipts, and pay via QR codes directly inside Telegram.
 
 ## 📋 Overview
-SikaSwift transforms Telegram into a secure mobile money wallet. It replaces complex USSD menus (*170#) with simple natural language commands.
+SikaSwift transforms Telegram into a secure mobile money wallet. It replaces complex USSD menus (*170#) with simple natural language commands like *"Send 50 cedis to Kofi"*.
 
-Unlike basic bots, SikaSwift is a **full-stack fintech product** featuring bank-grade security (PINs), identity verification, and automated receipt generation.
+Unlike basic bots, SikaSwift is a **full-stack fintech product** featuring bank-grade security (PINs), identity verification, and AI that understands **English, Pidgin, and Twi**.
 
 **Example Flow:**
-> *User:* "Send 50 cedis to 0555123456"
+> *User:* "Chale send 50 cedis give 0555123456"
 > *Bot:* "🔍 Verifying..."
 > *Bot:* "👤 **Recipient Found: CALEB DUSSEY**"
 > *Bot:* "🔒 Enter your 4-digit PIN to confirm."
 
 ## ✨ Key Features
-* **🗣️ Natural Language Processing:** Understands commands like *"Send 20ghs to 0244..."*.
+* **🧠 Advanced AI (Gemini 2.0 Flash):** Understands context, typos, and local dialects (Twi/Pidgin) automatically.
 * **🔐 Bank-Grade Security:**
     * **Transaction PINs:** Hashed (bcrypt) and never stored in plain text.
     * **Auto-Delete:** PIN messages vanish instantly after typing for privacy.
@@ -23,10 +23,11 @@ Unlike basic bots, SikaSwift is a **full-stack fintech product** featuring bank-
     * **Generate:** Users can type `/myqr` to get a personal payment code.
     * **Scan:** Supports Deep Linking (`/start pay_NUMBER`) for one-tap payments.
 * **🛡️ Name Verification:** Automatically resolves and verifies the recipient's name via Paystack before money moves.
-* **👥 Referral System:** Built-in growth engine tracking who invited whom.
+* **💬 Conversational Mode:** Handles small talk and greetings when not processing payments.
 
 ## 🚀 Tech Stack
-* **Core:** Python 3.9+, FastAPI
+* **AI Engine:** Google Gemini 2.0 Flash
+* **Backend:** Python 3.9+, FastAPI
 * **Database:** PostgreSQL (via SQLModel/SQLAlchemy)
 * **Interface:** Telegram Bot API (Webhooks)
 * **Payments:** Paystack API (Collections, Disbursements, Identity)
@@ -36,7 +37,7 @@ Unlike basic bots, SikaSwift is a **full-stack fintech product** featuring bank-
 ## 🛠️ Architecture
 The system follows a **Two-Phase Commit** with a security middleware:
 
-1.  **Ingest:** NLP parses text → Extracts `Intent`, `Amount`, `Recipient`.
+1.  **Ingest:** AI parses text → Extracts `Intent`, `Amount`, `Recipient`.
 2.  **Verify:** Bot calls Paystack to verify Recipient Name.
 3.  **Auth:** User enters PIN → Bot validates hash → Bot auto-deletes PIN.
 4.  **Phase 1 (Debit):** Triggers Paystack `Charge` to debit User via Mobile Money prompt.
@@ -49,6 +50,7 @@ The system follows a **Two-Phase Commit** with a security middleware:
 * PostgreSQL Database
 * **Paystack Account:** Get Secret Key from Dashboard.
 * **Telegram Bot:** Get Token from @BotFather.
+* **Google AI Studio:** Get API Key (Free Tier supported).
 
 ### 2. Installation
 ```bash

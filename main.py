@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import asyncio
+import requests # Needed for chat action (typing status)
 from fastapi import FastAPI, Request, Depends, HTTPException
 from contextlib import asynccontextmanager
 from sqlmodel import Session, select
@@ -12,6 +13,7 @@ from database import init_db, get_session
 from models import Transaction, User
 from nlp import parse_message
 from telegram_utils import (
+    BASE_URL, # Imported for chat actions
     send_message, 
     send_photo, 
     send_name_confirmation, 
@@ -29,11 +31,13 @@ from paystack_utils import (
 )
 from security_utils import hash_pin, verify_pin
 from receipt_utils import generate_receipt
-from qr_utils import generate_payment_qr  # <--- NEW IMPORT
+from qr_utils import generate_payment_qr
+from chat_utils import get_ai_response  # <--- NEW IMPORT FOR CHAT
 
 # --- CONFIG ---
 load_dotenv()
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
+ADMIN_ID = "YOUR_ADMIN_ID_HERE" 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -139,25 +143,22 @@ async def telegram_webhook(request: Request, session: Session = Depends(get_sess
                         session.commit()
                     return {"status": "ok"}
 
-                # 3. QR CODE: AMOUNT ENTRY (NEW!)
+                # 3. QR CODE: AMOUNT ENTRY
                 if user.state == "AWAITING_QR_AMOUNT":
-                    # User scanned QR and is now typing amount (e.g., "50")
                     if text.replace('.', '', 1).isdigit():
                         amount = float(text)
-                        recipient = user.temp_data # We saved this during scan
+                        recipient = user.temp_data
                         
-                        # Reset State
                         user.state = "IDLE"
                         user.temp_data = None
                         session.add(user)
                         session.commit()
                         
-                        # Trigger Confirmation
                         verification = resolve_mobile_money(recipient)
                         name = verification["account_name"] if verification["status"] else "Unknown"
                         send_name_confirmation(chat_id, amount, recipient, name)
                     else:
-                        send_message(chat_id, "❌ Invalid amount. Enter a number (e.g. 10).")
+                        send_message(chat_id, "❌ Invalid amount.")
                     return {"status": "ok"}
 
                 # 4. WAITING FOR OTP (Legacy)
@@ -172,66 +173,69 @@ async def telegram_webhook(request: Request, session: Session = Depends(get_sess
 
             # --- COMMANDS ---
 
-            # QR GENERATION (NEW!)
+            if text.startswith("/support"):
+                complaint = text.replace("/support", "").strip()
+                if not complaint:
+                    send_message(chat_id, "⚠️ Usage: `/support My issue here`")
+                else:
+                    # Notify Admin
+                    if ADMIN_ID != "YOUR_ADMIN_ID_HERE":
+                        try: send_message(ADMIN_ID, f"🆘 **Ticket**\nUser: {chat_id}\nMsg: {complaint}")
+                        except: pass
+                    send_message(chat_id, "✅ Support request received.")
+                return {"status": "ok"}
+
             if text == "/myqr":
                 if not user:
                     send_message(chat_id, "Register first: /start")
                     return {"status": "ok"}
-                
-                send_message(chat_id, "🎨 Generating your Payment QR...")
                 qr_file = generate_payment_qr(user.phone_number)
                 send_photo(chat_id, qr_file, caption=f"Scan to pay **{user.phone_number}**")
                 try: os.remove(qr_file) 
                 except: pass
                 return {"status": "ok"}
 
-            # QR SCANNING (Deep Link) (NEW!)
             if text.startswith("/start pay_"):
-                # Format: /start pay_0555123456
                 try:
-                    target_phone = text.split("pay_")[1]
+                    target = text.split("pay_")[1]
                     if not user:
                         request_phone_number(chat_id)
                         return {"status": "ok"}
                     
-                    send_message(chat_id, f"🔍 QR Scanned! Verifying {target_phone}...")
-                    verification = resolve_mobile_money(target_phone)
-                    name = verification["account_name"] if verification["status"] else "Unknown User"
+                    verification = resolve_mobile_money(target)
+                    name = verification["account_name"] if verification["status"] else "Unknown"
                     
                     user.state = "AWAITING_QR_AMOUNT"
-                    user.temp_data = target_phone
+                    user.temp_data = target
                     session.add(user)
                     session.commit()
                     
-                    send_message(chat_id, f"✅ **Recipient:** {name}\n\n**How much do you want to send?**\n(Type the amount)")
+                    send_message(chat_id, f"✅ **Recipient:** {name}\n**Enter Amount:**")
                 except:
-                    send_message(chat_id, "❌ Invalid QR Code.")
+                    send_message(chat_id, "❌ Invalid QR.")
                 return {"status": "ok"}
 
-            # STANDARD COMMANDS
             if text == "/start":
-                send_message(chat_id, "👋 **Welcome!**\n\n/setpin - Secure Account\n/myqr - Get Payment Code\n/history - View Transactions")
+                send_message(chat_id, "👋 **Welcome to SikaSwift!**\n\n/setpin - Security\n/myqr - Receive Money\n/history - Transactions")
                 return {"status": "ok"}
             
             if text == "/setpin":
-                if not user:
-                    request_phone_number(chat_id)
+                if not user: request_phone_number(chat_id)
                 else:
                     user.state = "AWAITING_NEW_PIN"
                     session.add(user)
                     session.commit()
-                    send_message(chat_id, "🔐 Enter a **4-digit PIN**:")
+                    send_message(chat_id, "🔐 Enter **4-digit PIN**:")
                 return {"status": "ok"}
 
             if text == "/resetpin":
-                if not user:
-                    send_message(chat_id, "Register first.")
+                if not user: send_message(chat_id, "Register first.")
                 else:
                     user.state = "AWAITING_RESET_AUTH"
                     session.add(user)
                     session.commit()
                     request_phone_number(chat_id) 
-                    send_message(chat_id, "⚠️ **Security Check**\nTap 'Share Phone Number' below to reset PIN.")
+                    send_message(chat_id, "⚠️ **Security Check**\nTap 'Share Phone Number' below.")
                 return {"status": "ok"}
             
             if text == "/history":
@@ -248,9 +252,11 @@ async def telegram_webhook(request: Request, session: Session = Depends(get_sess
                     send_message(chat_id, msg)
                 return {"status": "ok"}
 
-            # NLP / SEND MONEY
+            # --- INTELLIGENT ROUTING (NLP vs CHAT) ---
             nlp_result = parse_message(text)
+            
             if nlp_result["intent"] == "SEND_MONEY":
+                # --- FINANCIAL LOGIC ---
                 if nlp_result["amount"] and nlp_result["recipient"]:
                     if not user:
                         request_phone_number(chat_id)
@@ -269,6 +275,17 @@ async def telegram_webhook(request: Request, session: Session = Depends(get_sess
                         send_message(chat_id, "⚠️ Could not verify name.")
                 else:
                     send_message(chat_id, "Try: 'Send 50 to 055...'")
+            
+            else:
+                # --- CONVERSATIONAL AI LOGIC ---
+                # 1. Show 'Typing...' status
+                try:
+                    requests.post(f"{BASE_URL}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+                except: pass
+                
+                # 2. Get AI Response
+                ai_reply = get_ai_response(text)
+                send_message(chat_id, ai_reply)
 
     return {"status": "ok"}
 
@@ -297,7 +314,6 @@ async def handle_callback(callback, session):
         user = session.get(User, chat_id)
         if not user: return
 
-        # Trigger Security Check
         user.state = "AWAITING_PIN_AUTH"
         user.temp_data = f"{amount}|{recipient}"
         session.add(user)
@@ -386,7 +402,6 @@ async def paystack_webhook(request: Request, session: Session = Depends(get_sess
                 if transfer_resp.get("status"):
                     txn.status = "DISBURSING"
                     if txn.telegram_chat_id:
-                        # RECEIPT GENERATION
                         receipt_file = generate_receipt(txn.sender_phone, txn.recipient_phone, txn.amount, txn.paystack_reference)
                         send_photo(txn.telegram_chat_id, receipt_file, caption="✅ **Transfer Complete!**")
                         try: os.remove(receipt_file)
